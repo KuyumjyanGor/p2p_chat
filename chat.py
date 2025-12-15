@@ -24,10 +24,9 @@ class PeerChat:
     def __init__(self, my_nick, contacts):
         self.my_nick = my_nick
         self.contacts = contacts
-        self.lock = threading.Lock()
 
     # ----------------------------------------------------
-    # XML stanza builder
+    # XML message builder
     # ----------------------------------------------------
     def build_message(self, to, text):
         return (
@@ -37,25 +36,59 @@ class PeerChat:
         )
 
     # ----------------------------------------------------
-    # Incoming message handler
+    # FIXED: Incoming connection handler
     # ----------------------------------------------------
     def handle_incoming(self, conn, addr):
-        try:
-            while True:
-                data = conn.recv(4096)
-                if not data:
-                    break
-                xml = data.decode().strip()
-                try:
-                    root = ET.fromstring(xml)
-                    sender = root.attrib.get("from", "?")
-                    body = (root.text or "").strip()
-                    print(f"\n[{sender}] {body}")
-                except Exception:
-                    print("Received malformed XML message.")
-        finally:
+        peer_ip = addr[0]
+        conn.settimeout(1)
+
+        # Identify peer by IP
+        peer_contact = None
+        for c in self.contacts:
+            if c.host == peer_ip:
+                peer_contact = c
+                break
+
+        # Reject duplicate incoming connection if outgoing exists
+        if peer_contact and peer_contact.socket is not None:
             conn.close()
-            print(f"Connection from {addr} closed.")
+            return
+
+        # Accept connection as primary
+        if peer_contact:
+            peer_contact.socket = conn
+            peer_contact.online = True
+            print(f"{peer_contact.nickname} is now ONLINE (incoming)")
+        else:
+            print(f"Incoming unknown peer from {peer_ip}")
+
+        while True:
+            try:
+                data = conn.recv(4096)
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+
+            if not data:
+                break
+
+            xml = data.decode().strip()
+            try:
+                root = ET.fromstring(xml)
+                sender = root.attrib.get("from", "?")
+                body = (root.text or "").strip()
+                print(f"\n[{sender}] {body}")
+            except Exception:
+                print("Malformed XML received.")
+
+        # Cleanup
+        if peer_contact:
+            print(f"{peer_contact.nickname} went OFFLINE")
+            peer_contact.online = False
+            peer_contact.socket = None
+
+        conn.close()
 
     # ----------------------------------------------------
     # Server thread
@@ -66,14 +99,11 @@ class PeerChat:
         srv.bind(("", PORT))
         srv.listen()
 
-        print(f"Listening on port {PORT}...")
+        print(f"Listening on port {PORT}")
 
         while True:
             conn, addr = srv.accept()
-            print(f"Incoming connection from {addr}")
-            threading.Thread(
-                target=self.handle_incoming, args=(conn, addr), daemon=True
-            ).start()
+            threading.Thread(target=self.handle_incoming, args=(conn, addr), daemon=True).start()
 
     # ----------------------------------------------------
     # Outgoing connector thread
@@ -86,41 +116,56 @@ class PeerChat:
                         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                         sock.settimeout(3)
                         sock.connect((c.host, PORT))
+                        sock.settimeout(1)
+
                         c.socket = sock
                         c.online = True
-                        print(f"{c.nickname} is now ONLINE")
-                        threading.Thread(
-                            target=self.listen_peer, args=(c,), daemon=True
-                        ).start()
+                        print(f"{c.nickname} is now ONLINE (outgoing)")
+
+                        threading.Thread(target=self.listen_peer, args=(c,), daemon=True).start()
                     except Exception:
                         pass
+
             time.sleep(RECONNECT_INTERVAL)
 
     # ----------------------------------------------------
-    # Listen to connected peer
+    # Listen to connected peer (outgoing connection)
     # ----------------------------------------------------
     def listen_peer(self, contact):
+        sock = contact.socket
+        sock.settimeout(1)
+
+        while True:
+            try:
+                data = sock.recv(4096)
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+
+            if not data:
+                break
+
+            xml = data.decode().strip()
+            try:
+                root = ET.fromstring(xml)
+                sender = root.attrib.get("from", "?")
+                body = (root.text or "").strip()
+                print(f"\n[{sender}] {body}")
+            except Exception:
+                print("Malformed XML received.")
+
+        print(f"{contact.nickname} went OFFLINE")
+        contact.online = False
+        contact.socket = None
+
         try:
-            while True:
-                data = contact.socket.recv(4096)
-                if not data:
-                    break
-                xml = data.decode().strip()
-                try:
-                    root = ET.fromstring(xml)
-                    sender = root.attrib.get("from", "?")
-                    body = (root.text or "").strip()
-                    print(f"\n[{sender}] {body}")
-                except Exception:
-                    print("Received malformed XML message.")
-        finally:
-            print(f"{contact.nickname} went OFFLINE")
-            contact.socket.close()
-            contact.socket = None
-            contact.online = False
+            sock.close()
+        except:
+            pass
 
     # ----------------------------------------------------
-    # Send chat message
+    # Send message
     # ----------------------------------------------------
     def send_message(self, nick, text):
         for c in self.contacts:
@@ -134,7 +179,7 @@ class PeerChat:
         print("Unknown contact.")
 
     # ----------------------------------------------------
-    # Main input loop
+    # User input loop
     # ----------------------------------------------------
     def run(self):
         threading.Thread(target=self.server_thread, daemon=True).start()
@@ -144,16 +189,15 @@ class PeerChat:
             cmd = input("> ").strip()
             if cmd.startswith("/msg"):
                 parts = cmd.split(" ", 2)
-                if len(parts) < 3:
-                    print("Usage: /msg nick message")
+                if len(parts) == 3:
+                    self.send_message(parts[1], parts[2])
                 else:
-                    nick, msg = parts[1], parts[2]
-                    self.send_message(nick, msg)
+                    print("Usage: /msg nickname message")
             elif cmd == "/list":
                 for c in self.contacts:
                     print(c)
             elif cmd == "/quit":
-                print("Bye.")
+                print("Exiting.")
                 sys.exit(0)
             else:
                 print("Commands: /msg, /list, /quit")
@@ -173,5 +217,4 @@ if __name__ == "__main__":
         nick, ip = entry.split("@")
         contacts.append(Contact(nick, ip))
 
-    app = PeerChat(mynick, contacts)
-    app.run()
+    PeerChat(mynick, contacts).run()
